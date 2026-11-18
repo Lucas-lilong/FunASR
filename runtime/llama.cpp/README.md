@@ -59,6 +59,31 @@ cmake -B build -DCMAKE_BUILD_TYPE=Release      # fetches pinned llama.cpp; stati
 cmake --build build -j                          # -> build/bin/llama-funasr-* (all tools)
 ```
 
+## Resident server mode (`--server`)
+
+`llama-funasr-cli` can run as a long-lived process instead of re-loading the
+encoder and LLM for every request. This is what the FunASR CPU service uses for
+real-time VAD segments: the model load happens once, then each request is one
+JSON line on stdin.
+
+```bash
+./build/bin/llama-funasr-cli --server \
+  --enc funasr-encoder-f16.gguf -m qwen3-0.6b-q8_0.gguf
+```
+
+- stdout: `{"ready": true}` after the models are loaded, then one line per
+  request — `{"id":1,"text":"...","ms":123}` or `{"id":1,"error":"..."}`.
+- stdin: `{"id":1,"audio":"C:\\tmp\\seg.wav"}`, with the optional
+  `"hotword":"满意 方便"` field spliced into the official Fun-ASR-Nano prompt
+  (same wording as `funasr/models/fun_asr_nano/inference_vllm.py`).
+- Responses are matched by `id` and may arrive out of order.
+- `--server-workers N` (default 1) keeps N llama contexts, so up to N requests
+  decode concurrently. The default serializes requests like the CLI; raise it
+  only when there are spare cores and memory (each context has its own KV cache,
+  and each encoder pass allocates its own graph workspace).
+- Missing fields / malformed lines get `{"error":"bad json"}` and do not stop
+  the process. The `-a`, `--srt` and `--chunk` flags are irrelevant in this mode.
+
 ## SRT subtitle output
 
 Fun-ASR-Nano, SenseVoiceSmall, and Paraformer accept `--srt` and write standard

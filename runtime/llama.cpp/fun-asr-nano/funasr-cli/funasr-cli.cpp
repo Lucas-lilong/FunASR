@@ -15,12 +15,20 @@
 #include "gguf.h"
 #include "llama.h"
 
+#include <algorithm>
 #include <cmath>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <deque>
+#include <exception>
+#include <iostream>
 #include <map>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 // any audio (wav/mp3/flac, any rate/channels) -> 16 kHz mono f32, via miniaudio
@@ -167,18 +175,440 @@ static int decode_batch(llama_context*ctx,int n,llama_token*tok,float*embd,int n
     int r=llama_decode(ctx,b); n_past+=n; return r;
 }
 
+// ======================= prompt / model (shared by CLI and --server) =======================
+static const char* SYS_PREFIX =
+    "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\n";
+static const char* CHAT_SUFFIX = "<|im_end|>\n<|im_start|>assistant\n";
+
+// "满意 方便" / "满意\u3000方便" -> {"满意","方便"}; same input shape as the
+// Python client sends in the optional `hotword` field.
+static std::vector<std::string> split_hotwords(const std::string& s){
+    std::vector<std::string> out; std::string cur; size_t i=0;
+    while(i<s.size()){
+        unsigned char c=(unsigned char)s[i];
+        bool ascii_ws = (c==' '||c=='\t'||c=='\r'||c=='\n');
+        bool ideographic_space = (c==0xE3 && i+2<s.size() &&
+                                  (unsigned char)s[i+1]==0x80 && (unsigned char)s[i+2]==0x80);
+        if(ascii_ws || ideographic_space){
+            if(!cur.empty()){ out.push_back(cur); cur.clear(); }
+            i += ideographic_space ? 3 : 1;
+        } else { cur.push_back(s[i]); i++; }
+    }
+    if(!cur.empty()) out.push_back(cur);
+    return out;
+}
+
+// Mirrors funasr/models/fun_asr_nano/inference_vllm.py::_build_prompt_text()
+// so the C++ server biases the LLM with the same wording as the Python stack.
+static std::string build_user_text(const std::string& hotword){
+    auto hw = split_hotwords(hotword);
+    if(hw.empty()) return "语音转写：";
+    std::string joined;
+    for(size_t i=0;i<hw.size();i++){ if(i) joined += ", "; joined += hw[i]; }
+    std::string p = "请结合上下文信息，更加准确地完成语音转写任务。如果没有相关信息，我们会留空。\n\n\n**上下文信息：**\n\n\n";
+    p += "热词列表：[" + joined + "]\n";
+    p += "语音转写：";
+    return p;
+}
+
+static std::vector<llama_token> tokenize_text(const llama_vocab* v,const std::string& s){
+    int n=-llama_tokenize(v,s.c_str(),(int)s.size(),nullptr,0,false,true);
+    if(n<=0) return {};
+    std::vector<llama_token> out(n);
+    llama_tokenize(v,s.c_str(),(int)s.size(),out.data(),n,false,true);
+    return out;
+}
+
+struct asr_model { enc_model em; llama_model* model=nullptr; const llama_vocab* vocab=nullptr; };
+
+static bool load_asr_model(asr_model& m,const std::string& enc_path,const std::string& llm_path){
+    if(!load_enc(enc_path.c_str(),m.em)) return false;
+    ggml_backend_load_all();
+    llama_model_params mp=llama_model_default_params(); mp.n_gpu_layers=0;
+    m.model=llama_model_load_from_file(llm_path.c_str(),mp);
+    if(!m.model) return false;
+    m.vocab=llama_model_get_vocab(m.model);
+    return true;
+}
+
+static void free_asr_model(asr_model& m){
+    if(m.model) llama_model_free(m.model);
+    if(m.em.ctx_w) ggml_free(m.em.ctx_w);
+    m.model=nullptr; m.vocab=nullptr; m.em.ctx_w=nullptr;
+}
+
+static llama_context* new_llama_ctx(asr_model& m){
+    llama_context_params cp=llama_context_default_params();
+    cp.n_ctx=2048; cp.n_batch=2048; cp.n_ubatch=2048;
+    return llama_init_from_model(m.model,cp);
+}
+
+static llama_sampler* new_sampler(const llama_vocab* vocab,float rep){
+    auto sp=llama_sampler_chain_default_params();
+    llama_sampler* smpl=llama_sampler_chain_init(sp);
+    if(rep!=1.0f) llama_sampler_chain_add(smpl,llama_sampler_init_penalties(llama_vocab_n_tokens(vocab),256,rep,0.0f,0.0f));
+    llama_sampler_chain_add(smpl,llama_sampler_init_greedy());
+    return smpl;
+}
+
+// ======================= one request =======================
+struct asr_opts {
+    int npred=512;
+    double chunk_sec=0;
+    float rep=1.0f;
+    int vad_maxseg=30000;
+    bool log_vad=true;          // CLI parity: log segment count; server keeps stderr quiet
+    std::string vad_path;
+};
+
+struct seg_result { int start_ms=0; int end_ms=0; std::string text; };
+
+// Same decode path as the CLI's single-file mode, but reuse a resident
+// llama_context. The caller owns ctx; VAD/fbank/encoder work is per request.
+static bool transcribe_segments(asr_model& m,llama_context* ctx,const asr_opts& o,
+                                const std::string& wav_path,const std::string& hotword,
+                                std::vector<seg_result>& segs){
+    std::vector<float> wav;
+    if(!funasr_load_audio_16k_mono(wav_path.c_str(),wav)) return false;
+
+    std::vector<std::pair<int,int>> wins;
+    if(!o.vad_path.empty()){
+        std::vector<std::pair<int,int>> vsegs; // ms
+        if(!funasr_vad_segments(o.vad_path,wav,o.vad_maxseg,vsegs)) return false;
+        for(auto&s:vsegs){
+            int off=(int)((int64_t)s.first*16000/1000), end=(int)((int64_t)s.second*16000/1000);
+            if(end>(int)wav.size()) end=wav.size();
+            if(end-off>0) wins.push_back({off,end-off});
+        }
+        if(o.log_vad) fprintf(stderr,"[vad] %zu segments\n",wins.size());
+    } else {
+        int chunk_n = o.chunk_sec > 0 ? std::max(1,(int)(o.chunk_sec*16000)) : (int)wav.size();
+        for(size_t off=0; off<wav.size(); off+=chunk_n)
+            wins.push_back({(int)off,(int)std::min((size_t)chunk_n,wav.size()-off)});
+    }
+
+    std::vector<llama_token> pre = tokenize_text(m.vocab, std::string(SYS_PREFIX)+build_user_text(hotword));
+    std::vector<llama_token> suf = tokenize_text(m.vocab, CHAT_SUFFIX);
+    if(pre.empty() || suf.empty()) return false;
+
+    llama_sampler* smpl = new_sampler(m.vocab,o.rep);
+    for(auto& w:wins){
+        int off=w.first, len=w.second;
+        if(len < WINLEN) continue;                    // too short for one frame
+        int start_ms=(int)((int64_t)off*1000/16000);
+        int end_ms=(int)((int64_t)(off+len)*1000/16000);
+        std::vector<float> seg(wav.begin()+off,wav.begin()+off+len);
+        int T=0; auto fbank=compute_fbank(seg,T);
+        int D=0; auto adp=run_encoder(m.em,fbank,T,560,D);
+        int ol=1+(T-3+2)/2; ol=1+(ol-3+2)/2; int n_aud=(ol-1)/2+1;
+
+        llama_memory_clear(llama_get_memory(ctx),true);  // fresh context per window
+        int n_past=0;
+        decode_batch(ctx,(int)pre.size(),pre.data(),nullptr,0,n_past,false);
+        decode_batch(ctx,n_aud,nullptr,adp.data(),D,n_past,false);
+        decode_batch(ctx,(int)suf.size(),suf.data(),nullptr,0,n_past,true);
+
+        std::string text;
+        llama_token tk=llama_sampler_sample(smpl,ctx,-1);
+        for(int i=0;i<o.npred;i++){
+            if(llama_vocab_is_eog(m.vocab,tk)) break;
+            char buf[256]; int k=llama_token_to_piece(m.vocab,tk,buf,sizeof(buf),0,true);
+            if(k>0) text.append(buf,k);
+            decode_batch(ctx,1,&tk,nullptr,0,n_past,true);
+            tk=llama_sampler_sample(smpl,ctx,-1);
+        }
+        segs.push_back({start_ms,end_ms,text});
+    }
+    llama_sampler_free(smpl);
+    return true;
+}
+
+// ======================= minimal JSON (stdin/stdout protocol) =======================
+struct json_request { bool has_id=false; long long id=0; std::string audio; std::string hotword; };
+
+static void json_skip_ws(const std::string& s,size_t& i){
+    while(i<s.size() && (s[i]==' '||s[i]=='\t'||s[i]=='\r'||s[i]=='\n')) i++;
+}
+
+static bool json_hex4(const std::string& s,size_t& i,unsigned& cp){
+    if(i+4>s.size()) return false; cp=0;
+    for(int k=0;k<4;k++){
+        char h=s[i++]; cp<<=4;
+        if(h>='0'&&h<='9') cp|=(unsigned)(h-'0');
+        else if(h>='a'&&h<='f') cp|=(unsigned)(h-'a'+10);
+        else if(h>='A'&&h<='F') cp|=(unsigned)(h-'A'+10);
+        else return false;
+    }
+    return true;
+}
+
+static void utf8_append(std::string& out,unsigned cp){
+    if(cp<0x80) out.push_back((char)cp);
+    else if(cp<0x800){ out.push_back((char)(0xC0|(cp>>6))); out.push_back((char)(0x80|(cp&0x3F))); }
+    else if(cp<0x10000){
+        out.push_back((char)(0xE0|(cp>>12)));
+        out.push_back((char)(0x80|((cp>>6)&0x3F)));
+        out.push_back((char)(0x80|(cp&0x3F)));
+    } else {
+        out.push_back((char)(0xF0|(cp>>18)));
+        out.push_back((char)(0x80|((cp>>12)&0x3F)));
+        out.push_back((char)(0x80|((cp>>6)&0x3F)));
+        out.push_back((char)(0x80|(cp&0x3F)));
+    }
+}
+
+static bool json_parse_string(const std::string& s,size_t& i,std::string& out){
+    if(i>=s.size() || s[i]!='"') return false;
+    i++; out.clear();
+    while(i<s.size()){
+        char c=s[i++];
+        if(c=='"') return true;
+        if(c!='\\'){ out.push_back(c); continue; }
+        if(i>=s.size()) return false;
+        char e=s[i++];
+        switch(e){
+            case '"': out.push_back('"'); break;
+            case '\\': out.push_back('\\'); break;
+            case '/': out.push_back('/'); break;
+            case 'b': out.push_back('\b'); break;
+            case 'f': out.push_back('\f'); break;
+            case 'n': out.push_back('\n'); break;
+            case 'r': out.push_back('\r'); break;
+            case 't': out.push_back('\t'); break;
+            case 'u': {
+                unsigned cp=0;
+                if(!json_hex4(s,i,cp)) return false;
+                if(cp>=0xD800 && cp<=0xDBFF){   // surrogate pair
+                    size_t j=i;
+                    if(j+6<=s.size() && s[j]=='\\' && s[j+1]=='u'){
+                        j+=2; unsigned lo=0;
+                        if(json_hex4(s,j,lo) && lo>=0xDC00 && lo<=0xDFFF){
+                            cp=0x10000+((cp-0xD800)<<10)+(lo-0xDC00);
+                            i=j;
+                        }
+                    }
+                }
+                utf8_append(out,cp);
+                break;
+            }
+            default: return false;
+        }
+    }
+    return false;
+}
+
+static bool json_skip_value(const std::string& s,size_t& i){
+    json_skip_ws(s,i);
+    if(i>=s.size()) return false;
+    char c=s[i];
+    if(c=='"'){ std::string tmp; return json_parse_string(s,i,tmp); }
+    if(c=='{' || c=='['){
+        char close = c=='{' ? '}' : ']';
+        i++; json_skip_ws(s,i);
+        if(i<s.size() && s[i]==close){ i++; return true; }
+        while(true){
+            if(c=='{'){
+                std::string key; json_skip_ws(s,i);
+                if(!json_parse_string(s,i,key)) return false;
+                json_skip_ws(s,i);
+                if(i>=s.size() || s[i]!=':') return false;
+                i++;
+            }
+            if(!json_skip_value(s,i)) return false;
+            json_skip_ws(s,i);
+            if(i>=s.size()) return false;
+            if(s[i]==','){ i++; continue; }
+            if(s[i]==close){ i++; return true; }
+            return false;
+        }
+    }
+    static const char* lits[] = { "true", "false", "null" };
+    for(auto lit : lits){
+        size_t n=strlen(lit);
+        if(s.compare(i,n,lit)==0){ i+=n; return true; }
+    }
+    if(c=='-' || (c>='0'&&c<='9')){
+        i++;
+        while(i<s.size() && (s[i]=='.'||s[i]=='e'||s[i]=='E'||s[i]=='+'||s[i]=='-'||(s[i]>='0'&&s[i]<='9')) i++;
+        return true;
+    }
+    return false;
+}
+
+static bool parse_request(const std::string& s,json_request& r){
+    size_t i=0; json_skip_ws(s,i);
+    if(i>=s.size() || s[i]!='{') return false;
+    i++; json_skip_ws(s,i);
+    if(i<s.size() && s[i]=='}') return true;
+    while(i<s.size()){
+        std::string key;
+        if(!json_parse_string(s,i,key)) return false;
+        json_skip_ws(s,i);
+        if(i>=s.size() || s[i]!=':') return false;
+        i++; json_skip_ws(s,i);
+        if(key=="id"){
+            if(i<s.size() && s[i]=='"'){
+                std::string v;
+                if(!json_parse_string(s,i,v)) return false;
+                r.id=strtoll(v.c_str(),nullptr,10); r.has_id=true;
+            } else if(i<s.size() && (s[i]=='-' || (s[i]>='0'&&s[i]<='9'))){
+                const char* start=s.c_str()+i; char* end=nullptr;
+                long long v=strtoll(start,&end,10);
+                if(end==start) return false;
+                i+=(size_t)(end-start); r.id=v; r.has_id=true;
+            } else return false;
+        } else if(key=="audio"){
+            if(!json_parse_string(s,i,r.audio)) return false;
+        } else if(key=="hotword"){
+            if(!json_parse_string(s,i,r.hotword)) return false;
+        } else {
+            if(!json_skip_value(s,i)) return false;
+        }
+        json_skip_ws(s,i);
+        if(i>=s.size()) return false;
+        if(s[i]=='}'){ i++; return true; }
+        if(s[i]!=',') return false;
+        i++; json_skip_ws(s,i);
+    }
+    return false;
+}
+
+static std::string json_escape(const std::string& s){
+    std::string o; o.reserve(s.size()+8);
+    for(unsigned char c : s){
+        switch(c){
+            case '"': o += "\\\""; break;
+            case '\\': o += "\\\\"; break;
+            case '\n': o += "\\n"; break;
+            case '\r': o += "\\r"; break;
+            case '\t': o += "\\t"; break;
+            case '\b': o += "\\b"; break;
+            case '\f': o += "\\f"; break;
+            default:
+                if(c<0x20){ char b[8]; snprintf(b,sizeof(b),"\\u%04x",(unsigned)c); o += b; }
+                else o.push_back((char)c);
+        }
+    }
+    return o;
+}
+
+// ======================= resident server =======================
+// Protocol (see docs/llamacpp-server-protocol.md in the asr-stream service):
+//   stdin : one JSON per line  {"id":1,"audio":"C:\\tmp\\seg.wav","hotword":"满意 方便"}
+//   stdout: {"ready": true} once, then {"id":1,"text":"...","ms":123} or {"id":1,"error":"..."}
+// Model/encoder are loaded once; each worker owns one llama_context so requests
+// from different ids can be decoded concurrently.
+static int run_server(asr_model& m,const asr_opts& o,int n_workers){
+    if(n_workers<1) n_workers=1;
+    if(n_workers>16) n_workers=16;
+    std::vector<llama_context*> ctxs;
+    for(int i=0;i<n_workers;i++){
+        llama_context* ctx=new_llama_ctx(m);
+        if(!ctx){
+            fprintf(stderr,"[server] failed to create llama context (%d/%d)\n",i+1,n_workers);
+            for(auto c:ctxs) llama_free(c);
+            return 1;
+        }
+        ctxs.push_back(ctx);
+    }
+
+    fprintf(stderr,"[server] ready, workers=%d\n",n_workers);
+    printf("{\"ready\": true}\n");
+    fflush(stdout);
+
+    std::mutex mtask, mout;
+    std::condition_variable cv;
+    std::deque<std::string> tasks;
+    bool stop=false;
+
+    auto respond=[&](const std::string& payload){
+        std::lock_guard<std::mutex> lock(mout);
+        fwrite(payload.data(),1,payload.size(),stdout);
+        fflush(stdout);
+    };
+
+    auto handle=[&](llama_context* ctx,const std::string& line){
+        json_request req;
+        if(!parse_request(line,req) || !req.has_id){
+            respond("{\"error\":\"bad json\"}\n");
+            return;
+        }
+        int64_t t0=ggml_time_us();
+        std::vector<seg_result> segs;
+        bool ok=false;
+        try {
+            ok=transcribe_segments(m,ctx,o,req.audio,req.hotword,segs);
+        } catch(const std::exception& e){
+            fprintf(stderr,"[server] id=%lld exception: %s\n",req.id,e.what());
+        } catch(...){
+            fprintf(stderr,"[server] id=%lld exception\n",req.id);
+        }
+        int64_t t1=ggml_time_us();
+        std::string out;
+        if(!ok){
+            out="{\"id\":"+std::to_string(req.id)+",\"error\":\"failed to transcribe audio\"}\n";
+        } else {
+            std::string text;
+            for(auto& s : segs) text += s.text;
+            out="{\"id\":"+std::to_string(req.id)+",\"text\":\""+json_escape(text)+
+                "\",\"ms\":"+std::to_string((t1-t0)/1000)+"}\n";
+        }
+        respond(out);
+    };
+
+    std::vector<std::thread> workers;
+    for(int i=0;i<n_workers;i++){
+        llama_context* ctx=ctxs[i];
+        workers.emplace_back([&,ctx](){
+            while(true){
+                std::string line;
+                {
+                    std::unique_lock<std::mutex> lock(mtask);
+                    cv.wait(lock,[&]{ return stop || !tasks.empty(); });
+                    if(tasks.empty()) break;   // only when stop && empty
+                    line=tasks.front(); tasks.pop_front();
+                }
+                handle(ctx,line);
+            }
+        });
+    }
+
+    std::string line;
+    while(std::getline(std::cin,line)){
+        while(!line.empty() && (line.back()=='\r' || line.back()=='\n')) line.pop_back();
+        if(line.empty()) continue;
+        {
+            std::lock_guard<std::mutex> lock(mtask);
+            tasks.push_back(line);
+        }
+        cv.notify_one();
+    }
+    {
+        std::lock_guard<std::mutex> lock(mtask);
+        stop=true;
+    }
+    cv.notify_all();
+    for(auto& t : workers) t.join();
+    for(auto c : ctxs) llama_free(c);
+    fprintf(stderr,"[server] stdin closed, exit\n");
+    return 0;
+}
+
 static void print_usage(const char*argv0){
     fprintf(stderr,
         "usage: %s --enc enc.gguf -m llm.gguf -a audio.wav"
         " [-n npred] [--chunk sec]"
         " [--vad fsmn-vad.gguf [--vad-maxseg ms]]"
-        " [--srt] [--rep R]\n", argv0);
+        " [--srt] [--rep R]\n"
+        "       %s --server [--server-workers N] --enc enc.gguf -m llm.gguf\n"
+        "  (--server: resident process, one JSON request per stdin line;"
+        " model loads once)\n", argv0, argv0);
 }
 
 int main(int argc,char**argv){
-    std::string enc_path,llm_path,wav_path,vad_path; int npred=512; double chunk_sec=0; float rep=1.0f;
-    int vad_maxseg=30000;
-    bool srt_mode=false;
+    std::string enc_path,llm_path,wav_path,vad_path;
+    int npred=512; double chunk_sec=0; float rep=1.0f; int vad_maxseg=30000;
+    bool srt_mode=false; bool server_mode=false; int server_workers=1;
     for(int i=1;i<argc;i++){
         if(!strcmp(argv[i],"--enc")&&i+1<argc)enc_path=argv[++i];
         else if(!strcmp(argv[i],"-m")&&i+1<argc)llm_path=argv[++i];
@@ -189,94 +619,53 @@ int main(int argc,char**argv){
         else if(!strcmp(argv[i],"--vad-maxseg")&&i+1<argc)vad_maxseg=atoi(argv[++i]);
         else if(!strcmp(argv[i],"--srt"))srt_mode=true;
         else if(!strcmp(argv[i],"--rep")&&i+1<argc)rep=atof(argv[++i]);
+        else if(!strcmp(argv[i],"--server"))server_mode=true;
+        else if(!strcmp(argv[i],"--server-workers")&&i+1<argc)server_workers=atoi(argv[++i]);
         else { print_usage(argv[0]); return 1; }
     }
-    if(enc_path.empty()||llm_path.empty()||wav_path.empty()){fprintf(stderr,"missing args\n");print_usage(argv[0]);return 1;}
-
-    std::vector<float> wav;
-    if(!funasr_load_audio_16k_mono(wav_path.c_str(),wav)){fprintf(stderr,"failed to read audio\n");return 1;}
-    ggml_time_init(); // Required before ggml_time_us() on Windows.
-    int64_t t0=ggml_time_us();
-
-    enc_model em; if(!load_enc(enc_path.c_str(),em))return 1;
-    ggml_backend_load_all();
-    llama_model_params mp=llama_model_default_params(); mp.n_gpu_layers=0;
-    llama_model*model=llama_model_load_from_file(llm_path.c_str(),mp); if(!model)return 1;
-    const llama_vocab*vocab=llama_model_get_vocab(model);
-    llama_context_params cp=llama_context_default_params();
-    cp.n_ctx=2048; cp.n_batch=2048; cp.n_ubatch=2048;
-    llama_context*ctx=llama_init_from_model(model,cp);
-    if(!ctx){fprintf(stderr,"failed to create llama context\n");llama_model_free(model);return 1;}
-    auto sp=llama_sampler_chain_default_params(); llama_sampler*smpl=llama_sampler_chain_init(sp);
-    if(rep!=1.0f) llama_sampler_chain_add(smpl,llama_sampler_init_penalties(llama_vocab_n_tokens(vocab),256,rep,0.0f,0.0f));
-    llama_sampler_chain_add(smpl,llama_sampler_init_greedy());
-
-    const char*prefix="<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\n语音转写：";
-    const char*suffix="<|im_end|>\n<|im_start|>assistant\n";
-    auto tokenize=[&](const char*s){int n=-llama_tokenize(vocab,s,strlen(s),nullptr,0,false,true);
-        std::vector<llama_token> v(n); llama_tokenize(vocab,s,strlen(s),v.data(),n,false,true); return v;};
-    auto pre=tokenize(prefix); auto suf=tokenize(suffix);
-
-    // Build the list of [offset,len] windows to transcribe (in samples).
-    //   --vad : FSMN-VAD speech segments (single-binary front end, replaces fixed chunking)
-    //   --chunk sec : fixed-size chunks ; otherwise the whole file in one window
-    std::vector<std::pair<int,int>> wins;   // {sample offset, sample len}
-    if(!vad_path.empty()){
-        std::vector<std::pair<int,int>> segs; // ms
-        if(!funasr_vad_segments(vad_path,wav,vad_maxseg,segs)){fprintf(stderr,"vad failed\n");return 1;}
-        for(auto&s:segs){ int off=(int)((int64_t)s.first*16000/1000), end=(int)((int64_t)s.second*16000/1000);
-            if(end>(int)wav.size())end=wav.size(); if(end-off>0) wins.push_back({off,end-off}); }
-        fprintf(stderr,"[vad] %zu segments\n",wins.size());
-    } else {
-        int chunk_n = chunk_sec > 0 ? std::max(1, (int)(chunk_sec*16000)) : (int)wav.size();
-        for(size_t off=0; off<wav.size(); off+=chunk_n) wins.push_back({(int)off,(int)std::min((size_t)chunk_n,wav.size()-off)});
+    if(enc_path.empty()||llm_path.empty()||(!server_mode&&wav_path.empty())){
+        fprintf(stderr,"missing args\n");print_usage(argv[0]);return 1;
     }
 
-    int srt_idx = 0;
-    for (auto& w : wins) {
-        int off = w.first, len = w.second;
-        if (len < WINLEN) continue;                    // too short for one frame
-        int start_ms = (int)((int64_t)off * 1000 / 16000);
-        int end_ms   = (int)((int64_t)(off + len) * 1000 / 16000);
-        std::vector<float> seg(wav.begin()+off, wav.begin()+off+len);
-        int T=0; auto fbank=compute_fbank(seg,T);
-        int D=0; auto adp=run_encoder(em,fbank,T,560,D);
-        int ol=1+(T-3+2)/2; ol=1+(ol-3+2)/2; int n_aud=(ol-1)/2+1;
+    ggml_time_init(); // Required before ggml_time_us() on Windows.
 
-        llama_memory_clear(llama_get_memory(ctx), true);  // fresh context per chunk
-        int n_past=0;
-        decode_batch(ctx,pre.size(),pre.data(),nullptr,0,n_past,false);
-        decode_batch(ctx,n_aud,nullptr,adp.data(),D,n_past,false);
-        decode_batch(ctx,suf.size(),suf.data(),nullptr,0,n_past,true);
+    asr_model m;
+    if(!load_asr_model(m,enc_path,llm_path)) return 1;
 
-        // In SRT mode, buffer tokens and print the whole entry via format_srt_line.
-        // In normal mode, stream tokens directly (original behavior, no per-segment newline).
-        std::string seg_text;
-        llama_token tk=llama_sampler_sample(smpl,ctx,-1);
-        for(int i=0;i<npred;i++){
-            if(llama_vocab_is_eog(vocab,tk))break;
-            char buf[256]; int k=llama_token_to_piece(vocab,tk,buf,sizeof(buf),0,true);
-            if(k>0){
-                seg_text.append(buf, k);
-            }
-            decode_batch(ctx,1,&tk,nullptr,0,n_past,true);
-            tk=llama_sampler_sample(smpl,ctx,-1);
-        }
+    asr_opts o; o.npred=npred; o.chunk_sec=chunk_sec; o.rep=rep;
+    o.vad_maxseg=vad_maxseg; o.vad_path=vad_path; o.log_vad=!server_mode;
 
+    if(server_mode){
+        int rc=run_server(m,o,server_workers);
+        free_asr_model(m);
+        return rc;
+    }
+
+    int64_t t0=ggml_time_us();
+    llama_context* ctx=new_llama_ctx(m);
+    if(!ctx){fprintf(stderr,"failed to create llama context\n");free_asr_model(m);return 1;}
+
+    std::vector<seg_result> segs;
+    if(!transcribe_segments(m,ctx,o,wav_path,"",segs)){
+        fprintf(stderr,"failed to transcribe audio\n");
+        llama_free(ctx); free_asr_model(m); return 1;
+    }
+
+    int srt_idx=0;
+    for(auto& s : segs){
         if(srt_mode){
-            if (seg_text != "/sil") {
+            if(s.text != "/sil"){
                 srt_idx++;
-                format_srt_line(srt_idx, start_ms, end_ms, seg_text);
+                format_srt_line(srt_idx,s.start_ms,s.end_ms,s.text);
             }
         } else {
-            printf("%s", seg_text.c_str());
+            printf("%s",s.text.c_str());
         }
         fflush(stdout);
     }
     if(!srt_mode) printf("\n");
     int64_t t2=ggml_time_us();
-    fprintf(stderr,"[done] %.2fs ; chunk=%.0fs\n",(t2-t0)/1e6, chunk_sec);
-    llama_sampler_free(smpl); llama_free(ctx); llama_model_free(model);
-    if(em.ctx_w) ggml_free(em.ctx_w);
+    fprintf(stderr,"[done] %.2fs ; chunk=%.0fs\n",(t2-t0)/1e6,chunk_sec);
+    llama_free(ctx); free_asr_model(m);
     return 0;
 }
