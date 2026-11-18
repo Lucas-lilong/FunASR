@@ -429,7 +429,7 @@ static bool json_skip_value(const std::string& s,size_t& i){
     }
     if(c=='-' || (c>='0'&&c<='9')){
         i++;
-        while(i<s.size() && (s[i]=='.'||s[i]=='e'||s[i]=='E'||s[i]=='+'||s[i]=='-'||(s[i]>='0'&&s[i]<='9')) i++;
+        while(i<s.size() && (s[i]=='.'||s[i]=='e'||s[i]=='E'||s[i]=='+'||s[i]=='-'||(s[i]>='0'&&s[i]<='9'))) i++;
         return true;
     }
     return false;
